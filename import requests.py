@@ -9,19 +9,30 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+from dotenv import load_dotenv
 
-GMAIL_USER = 'd.lebeshev@audentes.it'       # ← твой gmail
-GMAIL_PASSWORD = 'wgbe tikz thyi hscb'       # ← app password (не обычный пароль!) d.lebeshev@audentes.it
-EMAIL_TO = 'y.fortunsky@audentes.it'           # ← куда слать
+load_dotenv()
+
+GMAIL_USER = os.environ['GMAIL_USER']
+GMAIL_PASSWORD = os.environ['GMAIL_PASSWORD']
+EMAIL_TO = os.environ['EMAIL_TO']
+
+API_LOGIN = os.environ['API_LOGIN']
+API_PASSWORD = os.environ['API_PASSWORD']
+API_HOST = os.environ['API_HOST']
+API_PORT = os.environ['API_PORT']
+API_IP = os.environ['API_IP']
+
+API_BASE_URL = f'http://{API_HOST}:{API_PORT}'
 
 SESSION_ID = None
 
 def authorize_user():
-    url = 'http://194.28.167.23:8070/api/login/'
+    url = f'{API_BASE_URL}/api/login/'
     payload = {
-        'login': 'API', 
-        'password': 'k5g7b9LhUG2T',
-        'ip': '194.28.167.23'
+        'login': API_LOGIN,
+        'password': API_PASSWORD,
+        'ip': API_IP
     }
     headers = {'Content-Type': 'application/json'}
     response = requests.post(url, data=json.dumps(payload), headers=headers)
@@ -46,7 +57,7 @@ def init_session():
         return False
 
 def active_calls_get():
-    url = 'http://194.28.167.23:8070/api/active_calls_get/'
+    url = f'{API_BASE_URL}/api/active_calls_get/'
     payload = {
         'session_id': SESSION_ID,
         'data': {
