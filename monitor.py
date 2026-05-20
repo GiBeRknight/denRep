@@ -20,9 +20,9 @@ load_dotenv()
 # ============================================================
 
 # Polling / network
-POLL_INTERVAL_SEC = 30           # how often to query the API
+POLL_INTERVAL_SEC = 60           # how often to query the API
 REQUEST_TIMEOUT_SEC = 10
-SAVE_INTERVAL_SEC = 60           # how often to rewrite the xlsx on disk
+SAVE_INTERVAL_SEC = 300           # how often to rewrite the xlsx on disk
 MAX_RETRIES = 3
 
 # Telephony filter
