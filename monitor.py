@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import signal
@@ -119,22 +120,25 @@ def save_to_excel(rows, filepath):
     os.replace(tmp_path, filepath)
 
 
-def send_email_report(rows, hour):
+def send_email_report(rows, hour, test=False):
     if not rows:
         log.info('[%s:00] No rows for this hour, skip email', hour)
         return
 
     df = pd.DataFrame(rows, columns=['time', 'total_calls', 'connected', 'percent %'])
     html_table = df.to_html(index=False, border=1)
+    title_prefix = '[TEST] ' if test else ''
     html = f"""
     <html><body>
-        <h3>Отчёт по активным звонкам (TP {TP_IDS[0]}) за {hour}:00</h3>
+        <h3>{title_prefix}Отчёт по активным звонкам (TP {TP_IDS[0]}) за {hour}:00</h3>
         {html_table}
     </body></html>
     """
 
+    subject_prefix = '[TEST] ' if test else ''
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"Active Calls Report {datetime.now().strftime('%Y-%m-%d')} {hour}:00"
+    msg['Subject'] = (f"{subject_prefix}Active Calls Report "
+                      f"{datetime.now().strftime('%Y-%m-%d')} {hour}:00")
     msg['From'] = GMAIL_USER
     msg['To'] = EMAIL_TO
     msg.attach(MIMEText(html, 'html'))
@@ -143,7 +147,7 @@ def send_email_report(rows, hour):
         server.login(GMAIL_USER, GMAIL_PASSWORD)
         server.sendmail(GMAIL_USER, EMAIL_TO, msg.as_string())
 
-    log.info('[%s:00] Report sent to %s', hour, EMAIL_TO)
+    log.info('[%s:00] %sReport sent to %s', hour, subject_prefix, EMAIL_TO)
 
 
 _stop = False
@@ -214,5 +218,45 @@ def run_monitor():
     log.info('Stopped cleanly. Data saved to %s', filepath)
 
 
+def run_test():
+    """Single-shot: log in, fetch one snapshot, send a test email, exit.
+
+    Use for verifying that .env credentials, API access and Gmail SMTP all
+    work end-to-end before leaving the monitor running.
+    """
+    api = ApiClient()
+    if not api.login():
+        log.error('API login failed')
+        sys.exit(1)
+
+    result = api.active_calls()
+    if result is None:
+        log.error('Could not fetch active_calls from API')
+        sys.exit(1)
+
+    total, connected = result
+    percent = round((connected / total * 100), 2) if total > 0 else 0
+    now = datetime.now()
+    log.info('[%s] total=%d connected=%d percent=%s%% (test)',
+             now.strftime('%H:%M'), total, connected, percent)
+
+    rows = [[now.strftime('%H:%M'), total, connected, percent]]
+    try:
+        send_email_report(rows, now.strftime('%H'), test=True)
+    except Exception as e:
+        log.exception('Test email failed: %s', e)
+        sys.exit(1)
+
+    log.info('Test OK — credentials, API and SMTP all work.')
+
+
 if __name__ == '__main__':
-    run_monitor()
+    parser = argparse.ArgumentParser(description='Active calls monitor')
+    parser.add_argument('--test', action='store_true',
+                        help='Fetch one snapshot, send a test email, and exit')
+    args = parser.parse_args()
+
+    if args.test:
+        run_test()
+    else:
+        run_monitor()
