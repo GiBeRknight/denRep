@@ -27,6 +27,7 @@ MAX_RETRIES = 3
 
 # Telephony filter
 TP_IDS = [3576]
+BRAND_NAME = 'TELES'             # shown in the email header
 
 # Work window — monitor is active while
 # WORK_HOUR_START <= hour < WORK_HOUR_END   (24h clock)
@@ -150,9 +151,9 @@ def save_to_excel(rows, filepath):
 EMAIL_COLUMNS = ['time', 'total_calls', 'connected', 'percent %']
 
 THEMES = {
-    'normal': {'accent': '#1976d2', 'tag': ''},
-    'test':   {'accent': '#6a1b9a', 'tag': '[TEST] '},
-    'alert':  {'accent': '#d9534f', 'tag': '[ALERT] '},
+    'normal': {'accent': '#546e7a', 'tag': ''},          # muted blue-grey
+    'test':   {'accent': '#7e6b8f', 'tag': '[TEST] '},   # muted plum
+    'alert':  {'accent': '#a86464', 'tag': '[ALERT] '},  # muted brick red
 }
 
 
@@ -187,7 +188,7 @@ def render_html_report(rows, title, theme='normal'):
     <div style="padding:20px 24px; background:{accent}; color:#ffffff;">
       <div style="font-size:18px; font-weight:600; line-height:1.3;">{title}</div>
       <div style="margin-top:4px; font-size:13px; opacity:.85;">
-        {datetime.now().strftime('%Y-%m-%d %H:%M')} &middot; TP {TP_IDS[0]}
+        {datetime.now().strftime('%Y-%m-%d %H:%M')} &middot; {BRAND_NAME}
       </div>
     </div>
     <table style="border-collapse:collapse; width:100%; font-size:14px;">
@@ -216,21 +217,21 @@ def send_email_report(rows, hour, theme='normal'):
         log.info('[%s:00] No rows for this hour, skip email', hour)
         return
     tag = THEMES[theme]['tag']
-    subject = f"{tag}Active Calls Report {datetime.now().strftime('%Y-%m-%d')} {hour}:00"
-    title = f"{tag}Отчёт по активным звонкам за {hour}:00"
+    title = (f"{tag}{BRAND_NAME} Active Calls Report — "
+             f"{datetime.now().strftime('%Y-%m-%d')} {hour}:00")
     html = render_html_report(rows, title, theme=theme)
-    _send_email(subject, html)
+    _send_email(title, html)
     log.info('[%s:00] %sReport sent to %s', hour, tag, EMAIL_TO)
 
 
-def send_alert(rows, current_total):
-    tag = THEMES['alert']['tag']
-    subject = f"{tag}Active calls below {ALERT_THRESHOLD}: {current_total}"
-    title = (f"{tag}Активных звонков: {current_total} "
-             f"(порог {ALERT_THRESHOLD})")
+def send_alert(rows, current_total, test=False):
+    tag = ('[TEST]' + THEMES['alert']['tag']) if test else THEMES['alert']['tag']
+    title = (f"{tag}{BRAND_NAME} active calls: {current_total} "
+             f"(threshold {ALERT_THRESHOLD})")
     html = render_html_report(rows, title, theme='alert')
-    _send_email(subject, html)
-    log.warning('Alert sent: total_calls=%d < %d', current_total, ALERT_THRESHOLD)
+    _send_email(title, html)
+    log.warning('%sAlert sent: total_calls=%d (threshold %d)',
+                tag, current_total, ALERT_THRESHOLD)
 
 
 # ============================================================
@@ -381,11 +382,8 @@ def run_monitor():
     log.info('Stopped cleanly.')
 
 
-def run_test():
-    """Single-shot: log in, fetch one snapshot, send a test email, exit.
-
-    Ignores work hours so you can verify the pipeline at any time.
-    """
+def _fetch_one_snapshot():
+    """Log in, fetch one snapshot, return (rows, now). Exit with 1 on failure."""
     api = ApiClient()
     if not api.login():
         log.error('API login failed')
@@ -399,26 +397,46 @@ def run_test():
     total, connected = result
     percent = round((connected / total * 100), 2) if total > 0 else 0
     now = datetime.now()
-    log.info('[%s] total=%d connected=%d percent=%s%% (test)',
+    log.info('[%s] total=%d connected=%d percent=%s%%',
              now.strftime('%H:%M'), total, connected, percent)
+    return [[now.strftime('%H:%M'), total, connected, percent]], now, total
 
-    rows = [[now.strftime('%H:%M'), total, connected, percent]]
+
+def run_test():
+    """Send a test hourly-style report with the current snapshot. Ignores work hours."""
+    rows, now, _ = _fetch_one_snapshot()
     try:
         send_email_report(rows, now.strftime('%H'), theme='test')
     except Exception as e:
         log.exception('Test email failed: %s', e)
         sys.exit(1)
-
     log.info('Test OK — credentials, API and SMTP all work.')
+
+
+def run_test_alert():
+    """Send a test alert email with the current snapshot. Ignores work hours
+    and the threshold — the alert goes out regardless of total_calls value."""
+    rows, _, total = _fetch_one_snapshot()
+    try:
+        send_alert(rows, total, test=True)
+    except Exception as e:
+        log.exception('Test alert email failed: %s', e)
+        sys.exit(1)
+    log.info('Test alert sent.')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Active calls monitor')
-    parser.add_argument('--test', action='store_true',
-                        help='Fetch one snapshot, send a test email, and exit')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--test', action='store_true',
+                      help='Fetch one snapshot, send a test hourly report, exit')
+    mode.add_argument('--test-alert', action='store_true',
+                      help='Fetch one snapshot, send a test alert email, exit')
     args = parser.parse_args()
 
     if args.test:
         run_test()
+    elif args.test_alert:
+        run_test_alert()
     else:
         run_monitor()
