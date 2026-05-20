@@ -39,6 +39,10 @@ ALERT_THRESHOLD = 100            # alert when total_calls < this
 ALERT_RECOVERY_COUNT = 3         # consecutive readings >= threshold required
                                  # before another alert can fire
 
+# Daily summary — sent once per day at this hour (24h clock).
+# Should be >= WORK_HOUR_END so the day's data is complete.
+DAILY_REPORT_HOUR = 21
+
 # ============================================================
 # Credentials (from .env)
 # ============================================================
@@ -157,10 +161,10 @@ THEMES = {
 }
 
 
-def render_html_report(rows, title, theme='normal'):
+def render_html_report(rows, title, theme='normal', columns=None, intro_html=''):
     """Self-contained HTML report. All styles inline — Gmail strips <style> blocks."""
     accent = THEMES[theme]['accent']
-    df = pd.DataFrame(rows, columns=EMAIL_COLUMNS)
+    df = pd.DataFrame(rows, columns=columns or EMAIL_COLUMNS)
 
     th_style = (
         f'padding:10px 14px; background:{accent}; color:#ffffff;'
@@ -189,6 +193,12 @@ def render_html_report(rows, title, theme='normal'):
         )
         body_rows.append(f'<tr>{cells}</tr>')
 
+    intro_block = (
+        f'<div style="padding:16px 24px; color:#444; font-size:14px; '
+        f'border-bottom:1px solid #eee;">{intro_html}</div>'
+        if intro_html else ''
+    )
+
     return f"""
 <html><body style="margin:0; padding:24px; font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#f4f5f7;">
   <div style="max-width:720px; margin:0 auto; background:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.08);">
@@ -198,6 +208,7 @@ def render_html_report(rows, title, theme='normal'):
         {datetime.now().strftime('%Y-%m-%d %H:%M')} &middot; {BRAND_NAME}
       </div>
     </div>
+    {intro_block}
     <table style="border-collapse:collapse; width:100%; font-size:14px;">
       <thead><tr>{header_cells}</tr></thead>
       <tbody>{''.join(body_rows)}</tbody>
@@ -240,6 +251,46 @@ def send_email_report(rows, hour, theme='normal'):
     html = render_html_report(body_rows, title, theme=theme)
     _send_email(title, html)
     log.info('[%s:00] %sReport sent to %s', hour, tag, EMAIL_TO)
+
+
+DAILY_COLUMNS = ['#', 'from', 'to', 'readings', 'min total']
+
+
+def send_daily_report(incidents, date_str, test=False):
+    """End-of-day summary: when total_calls dipped below ALERT_THRESHOLD,
+    in which time intervals and how many readings each dip lasted."""
+    tag = '[TEST] ' if test else ''
+    count = len(incidents)
+    title = (f"{tag}{BRAND_NAME} Daily Report {date_str} "
+             f"— {count} dip" + ('s' if count != 1 else ''))
+
+    if not incidents:
+        intro = (f'<p style="margin:0;">No readings below threshold '
+                 f'(<b>{ALERT_THRESHOLD}</b>) today.</p>')
+        # Single placeholder row so the table doesn't look broken
+        rows = [['—', '—', '—', 0, '—']]
+    else:
+        intro = (f'<p style="margin:0;">Active calls fell below threshold '
+                 f'(<b>{ALERT_THRESHOLD}</b>) <b>{count}</b> '
+                 f'time' + ('s' if count != 1 else '') +
+                 f' today.</p>')
+        rows = [
+            [i,
+             inc['start'],
+             inc['end'],
+             inc['readings'],
+             inc['min_total']]
+            for i, inc in enumerate(incidents, 1)
+        ]
+
+    html = render_html_report(
+        rows, title,
+        theme='alert' if incidents and not test else 'normal',
+        columns=DAILY_COLUMNS,
+        intro_html=intro,
+    )
+    _send_email(title, html)
+    log.info('%sDaily report sent (%d incidents) to %s', tag, count, EMAIL_TO)
 
 
 def send_alert(rows, current_total, test=False):
@@ -296,46 +347,89 @@ def run_monitor():
         sys.exit(1)
 
     rows = []
+    incidents = []
+    current_incident = None
     filepath = None
+    work_day_date = None
     last_save_ts = 0.0
     last_hour = None
-
     alert_active = False
     consecutive_ok = 0
+    work_day_finalized = False
 
     while not _stop:
         now = datetime.now()
 
-        # ---- Outside work hours: flush, sleep until next start ----
+        # =====================================================
+        #  Outside work hours: finalize day, then wait for the
+        #  daily-summary slot at DAILY_REPORT_HOUR, then reset.
+        # =====================================================
         if not in_work_hours(now):
-            if rows and last_hour is not None:
-                hour_rows = [r for r in rows if r[0].startswith(last_hour)]
-                try:
-                    send_email_report(hour_rows, last_hour)
-                except Exception as e:
-                    log.exception('send_email_report failed: %s', e)
+            # ---- Finalize the work day exactly once ----
+            if not work_day_finalized and rows:
+                if last_hour is not None:
+                    hour_rows = [r for r in rows if r[0].startswith(last_hour)]
+                    try:
+                        send_email_report(hour_rows, last_hour)
+                    except Exception as e:
+                        log.exception('send_email_report failed: %s', e)
                 try:
                     save_to_excel(rows, filepath)
                 except Exception as e:
                     log.exception('save_to_excel failed: %s', e)
+                # If a dip was still open when the work day ended, close it
+                if current_incident is not None:
+                    incidents.append(current_incident)
+                    current_incident = None
+                work_day_finalized = True
 
-            rows = []
-            filepath = None
-            last_hour = None
-            last_save_ts = 0.0
-            alert_active = False
-            consecutive_ok = 0
+            # ---- Send the daily summary at/after DAILY_REPORT_HOUR ----
+            ready_for_daily = (
+                work_day_finalized
+                and work_day_date is not None
+                and now.hour >= DAILY_REPORT_HOUR
+            )
+            if ready_for_daily:
+                try:
+                    send_daily_report(incidents, work_day_date)
+                except Exception as e:
+                    log.exception('send_daily_report failed: %s', e)
+                # Reset for the next work day
+                rows = []
+                incidents = []
+                current_incident = None
+                filepath = None
+                work_day_date = None
+                last_hour = None
+                last_save_ts = 0.0
+                alert_active = False
+                consecutive_ok = 0
+                work_day_finalized = False
 
-            wake = next_work_start(now)
-            sleep_sec = (wake - now).total_seconds()
-            log.info('Outside work hours; sleeping until %s (%.0f sec)',
+            # ---- Decide when to wake up ----
+            if work_day_finalized:
+                # Sleep until DAILY_REPORT_HOUR today
+                wake = now.replace(hour=DAILY_REPORT_HOUR,
+                                   minute=0, second=0, microsecond=0)
+                if wake <= now:
+                    # Already past it but somehow not finalized — go to morning
+                    wake = next_work_start(now)
+            else:
+                # Nothing to do — sleep until next work-day start
+                wake = next_work_start(now)
+
+            sleep_sec = max(1, (wake - now).total_seconds())
+            log.info('Sleeping until %s (%.0f sec)',
                      wake.strftime('%Y-%m-%d %H:%M'), sleep_sec)
             _interruptible_sleep(sleep_sec)
             continue
 
-        # ---- Inside work hours ----
+        # =====================================================
+        #  Inside work hours
+        # =====================================================
         if filepath is None:
-            filepath = f'active_calls_{now.strftime("%Y-%m-%d")}.xlsx'
+            work_day_date = now.strftime('%Y-%m-%d')
+            filepath = f'active_calls_{work_day_date}.xlsx'
             last_hour = now.strftime('%H')
 
         current_time = now.strftime('%H:%M')
@@ -349,10 +443,16 @@ def run_monitor():
                      current_time, total_calls, connected_calls, percent)
             rows.append([current_time, total_calls, connected_calls, percent])
 
-            # Alert state machine
+            # ---- Alert state machine + incident tracking ----
             if total_calls < ALERT_THRESHOLD:
                 consecutive_ok = 0
                 if not alert_active:
+                    current_incident = {
+                        'start': current_time,
+                        'end': current_time,
+                        'readings': 1,
+                        'min_total': total_calls,
+                    }
                     hour_rows = [r for r in rows if r[0].startswith(current_hour)]
                     try:
                         send_alert(hour_rows, total_calls)
@@ -360,6 +460,12 @@ def run_monitor():
                         log.exception('send_alert failed: %s', e)
                     alert_active = True
                 else:
+                    if current_incident is not None:
+                        current_incident['end'] = current_time
+                        current_incident['readings'] += 1
+                        current_incident['min_total'] = min(
+                            current_incident['min_total'], total_calls
+                        )
                     log.info('Still below threshold (%d), alert suppressed', total_calls)
             else:
                 if alert_active:
@@ -370,8 +476,11 @@ def run_monitor():
                         log.info('Alert cleared after %d OK readings', consecutive_ok)
                         alert_active = False
                         consecutive_ok = 0
+                        if current_incident is not None:
+                            incidents.append(current_incident)
+                            current_incident = None
 
-            # Periodic xlsx save
+            # ---- Periodic xlsx save ----
             now_ts = time.time()
             if now_ts - last_save_ts >= SAVE_INTERVAL_SEC:
                 try:
@@ -380,7 +489,7 @@ def run_monitor():
                     log.exception('save_to_excel failed: %s', e)
                 last_save_ts = now_ts
 
-            # Hourly report at top of every hour
+            # ---- Hourly email at top of every hour ----
             if current_hour != last_hour:
                 hour_rows = [r for r in rows if r[0].startswith(last_hour)]
                 try:
@@ -442,6 +551,22 @@ def run_test_alert():
     log.info('Test alert sent.')
 
 
+def run_test_daily():
+    """Send a fake daily report so you can see how it looks."""
+    fake_incidents = [
+        {'start': '07:00', 'end': '07:01', 'readings': 3, 'min_total': 78},
+        {'start': '13:45', 'end': '13:45', 'readings': 1, 'min_total': 92},
+        {'start': '16:30', 'end': '16:33', 'readings': 7, 'min_total': 61},
+    ]
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        send_daily_report(fake_incidents, today, test=True)
+    except Exception as e:
+        log.exception('Test daily email failed: %s', e)
+        sys.exit(1)
+    log.info('Test daily report sent.')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Active calls monitor')
     mode = parser.add_mutually_exclusive_group()
@@ -449,11 +574,15 @@ if __name__ == '__main__':
                       help='Fetch one snapshot, send a test hourly report, exit')
     mode.add_argument('--test-alert', action='store_true',
                       help='Fetch one snapshot, send a test alert email, exit')
+    mode.add_argument('--test-daily', action='store_true',
+                      help='Send a fake daily summary email and exit')
     args = parser.parse_args()
 
     if args.test:
         run_test()
     elif args.test_alert:
         run_test_alert()
+    elif args.test_daily:
+        run_test_daily()
     else:
         run_monitor()
