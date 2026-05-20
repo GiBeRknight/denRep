@@ -5,7 +5,7 @@ import signal
 import smtplib
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -14,6 +14,33 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ============================================================
+# Configuration — edit these to tune behaviour
+# ============================================================
+
+# Polling / network
+POLL_INTERVAL_SEC = 30           # how often to query the API
+REQUEST_TIMEOUT_SEC = 10
+SAVE_INTERVAL_SEC = 60           # how often to rewrite the xlsx on disk
+MAX_RETRIES = 3
+
+# Telephony filter
+TP_IDS = [3576]
+
+# Work window — monitor is active while
+# WORK_HOUR_START <= hour < WORK_HOUR_END   (24h clock)
+WORK_HOUR_START = 7              # 07:00 inclusive
+WORK_HOUR_END = 19               # 19:00 exclusive  (=> active 07:00 — 18:59)
+
+# Alerting
+ALERT_THRESHOLD = 100            # alert when total_calls < this
+ALERT_RECOVERY_COUNT = 3         # consecutive readings >= threshold required
+                                 # before another alert can fire
+
+# ============================================================
+# Credentials (from .env)
+# ============================================================
 
 GMAIL_USER = os.environ['GMAIL_USER']
 GMAIL_PASSWORD = os.environ['GMAIL_PASSWORD']
@@ -27,11 +54,7 @@ API_IP = os.environ['API_IP']
 
 API_BASE_URL = f'http://{API_HOST}:{API_PORT}'
 
-POLL_INTERVAL_SEC = 30
-REQUEST_TIMEOUT_SEC = 10
-SAVE_INTERVAL_SEC = 60
-MAX_RETRIES = 3
-TP_IDS = [3576]
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,35 +143,114 @@ def save_to_excel(rows, filepath):
     os.replace(tmp_path, filepath)
 
 
-def send_email_report(rows, hour, test=False):
-    if not rows:
-        log.info('[%s:00] No rows for this hour, skip email', hour)
-        return
+# ============================================================
+# Email rendering
+# ============================================================
 
-    df = pd.DataFrame(rows, columns=['time', 'total_calls', 'connected', 'percent %'])
-    html_table = df.to_html(index=False, border=1)
-    title_prefix = '[TEST] ' if test else ''
-    html = f"""
-    <html><body>
-        <h3>{title_prefix}Отчёт по активным звонкам (TP {TP_IDS[0]}) за {hour}:00</h3>
-        {html_table}
-    </body></html>
-    """
+EMAIL_COLUMNS = ['time', 'total_calls', 'connected', 'percent %']
 
-    subject_prefix = '[TEST] ' if test else ''
+THEMES = {
+    'normal': {'accent': '#1976d2', 'tag': ''},
+    'test':   {'accent': '#6a1b9a', 'tag': '[TEST] '},
+    'alert':  {'accent': '#d9534f', 'tag': '[ALERT] '},
+}
+
+
+def render_html_report(rows, title, theme='normal'):
+    """Self-contained HTML report. All styles inline — Gmail strips <style> blocks."""
+    accent = THEMES[theme]['accent']
+    df = pd.DataFrame(rows, columns=EMAIL_COLUMNS)
+
+    th_style = (
+        f'padding:10px 14px; background:{accent}; color:#ffffff;'
+        f' text-align:left; font-weight:600; border:1px solid {accent};'
+        ' font-size:13px; letter-spacing:.3px;'
+    )
+    td_style_base = (
+        'padding:10px 14px; border:1px solid #e6e6e6;'
+        ' font-variant-numeric: tabular-nums; color:#222;'
+    )
+
+    header_cells = ''.join(f'<th style="{th_style}">{c}</th>' for c in df.columns)
+
+    body_rows = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        bg = '#fafafa' if i % 2 else '#ffffff'
+        cells = ''.join(
+            f'<td style="{td_style_base} background:{bg};">{v}</td>' for v in row
+        )
+        body_rows.append(f'<tr>{cells}</tr>')
+
+    return f"""
+<html><body style="margin:0; padding:24px; font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#f4f5f7;">
+  <div style="max-width:720px; margin:0 auto; background:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.08);">
+    <div style="padding:20px 24px; background:{accent}; color:#ffffff;">
+      <div style="font-size:18px; font-weight:600; line-height:1.3;">{title}</div>
+      <div style="margin-top:4px; font-size:13px; opacity:.85;">
+        {datetime.now().strftime('%Y-%m-%d %H:%M')} &middot; TP {TP_IDS[0]}
+      </div>
+    </div>
+    <table style="border-collapse:collapse; width:100%; font-size:14px;">
+      <thead><tr>{header_cells}</tr></thead>
+      <tbody>{''.join(body_rows)}</tbody>
+    </table>
+  </div>
+</body></html>
+""".strip()
+
+
+def _send_email(subject, html_body):
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = (f"{subject_prefix}Active Calls Report "
-                      f"{datetime.now().strftime('%Y-%m-%d')} {hour}:00")
+    msg['Subject'] = subject
     msg['From'] = GMAIL_USER
     msg['To'] = EMAIL_TO
-    msg.attach(MIMEText(html, 'html'))
+    msg.attach(MIMEText(html_body, 'html'))
 
     with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=REQUEST_TIMEOUT_SEC) as server:
         server.login(GMAIL_USER, GMAIL_PASSWORD)
         server.sendmail(GMAIL_USER, EMAIL_TO, msg.as_string())
 
-    log.info('[%s:00] %sReport sent to %s', hour, subject_prefix, EMAIL_TO)
 
+def send_email_report(rows, hour, theme='normal'):
+    if not rows:
+        log.info('[%s:00] No rows for this hour, skip email', hour)
+        return
+    tag = THEMES[theme]['tag']
+    subject = f"{tag}Active Calls Report {datetime.now().strftime('%Y-%m-%d')} {hour}:00"
+    title = f"{tag}Отчёт по активным звонкам за {hour}:00"
+    html = render_html_report(rows, title, theme=theme)
+    _send_email(subject, html)
+    log.info('[%s:00] %sReport sent to %s', hour, tag, EMAIL_TO)
+
+
+def send_alert(rows, current_total):
+    tag = THEMES['alert']['tag']
+    subject = f"{tag}Active calls below {ALERT_THRESHOLD}: {current_total}"
+    title = (f"{tag}Активных звонков: {current_total} "
+             f"(порог {ALERT_THRESHOLD})")
+    html = render_html_report(rows, title, theme='alert')
+    _send_email(subject, html)
+    log.warning('Alert sent: total_calls=%d < %d', current_total, ALERT_THRESHOLD)
+
+
+# ============================================================
+# Work-hours helpers
+# ============================================================
+
+def in_work_hours(now):
+    return WORK_HOUR_START <= now.hour < WORK_HOUR_END
+
+
+def next_work_start(now):
+    candidate = now.replace(hour=WORK_HOUR_START, minute=0, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+# ============================================================
+# Main loop
+# ============================================================
 
 _stop = False
 
@@ -160,7 +262,7 @@ def _handle_signal(signum, _frame):
 
 
 def _interruptible_sleep(seconds):
-    for _ in range(seconds):
+    for _ in range(int(seconds)):
         if _stop:
             return
         time.sleep(1)
@@ -175,13 +277,49 @@ def run_monitor():
         log.error('Could not log in; exiting')
         sys.exit(1)
 
-    filepath = f'active_calls_{datetime.now().strftime("%Y-%m-%d")}.xlsx'
     rows = []
+    filepath = None
     last_save_ts = 0.0
-    last_hour = datetime.now().strftime('%H')
+    last_hour = None
+
+    alert_active = False
+    consecutive_ok = 0
 
     while not _stop:
         now = datetime.now()
+
+        # ---- Outside work hours: flush, sleep until next start ----
+        if not in_work_hours(now):
+            if rows and last_hour is not None:
+                hour_rows = [r for r in rows if r[0].startswith(last_hour)]
+                try:
+                    send_email_report(hour_rows, last_hour)
+                except Exception as e:
+                    log.exception('send_email_report failed: %s', e)
+                try:
+                    save_to_excel(rows, filepath)
+                except Exception as e:
+                    log.exception('save_to_excel failed: %s', e)
+
+            rows = []
+            filepath = None
+            last_hour = None
+            last_save_ts = 0.0
+            alert_active = False
+            consecutive_ok = 0
+
+            wake = next_work_start(now)
+            sleep_sec = (wake - now).total_seconds()
+            log.info('Outside work hours; sleeping until %s (%.0f sec)',
+                     wake.strftime('%Y-%m-%d %H:%M'), sleep_sec)
+            _interruptible_sleep(sleep_sec)
+            continue
+
+        # ---- Inside work hours ----
+        if filepath is None:
+            filepath = f'active_calls_{now.strftime("%Y-%m-%d")}.xlsx'
+            last_hour = now.strftime('%H')
+
         current_time = now.strftime('%H:%M')
         current_hour = now.strftime('%H')
 
@@ -193,6 +331,29 @@ def run_monitor():
                      current_time, total_calls, connected_calls, percent)
             rows.append([current_time, total_calls, connected_calls, percent])
 
+            # Alert state machine
+            if total_calls < ALERT_THRESHOLD:
+                consecutive_ok = 0
+                if not alert_active:
+                    hour_rows = [r for r in rows if r[0].startswith(current_hour)]
+                    try:
+                        send_alert(hour_rows, total_calls)
+                    except Exception as e:
+                        log.exception('send_alert failed: %s', e)
+                    alert_active = True
+                else:
+                    log.info('Still below threshold (%d), alert suppressed', total_calls)
+            else:
+                if alert_active:
+                    consecutive_ok += 1
+                    log.info('Above threshold (%d/%d OK readings)',
+                             consecutive_ok, ALERT_RECOVERY_COUNT)
+                    if consecutive_ok >= ALERT_RECOVERY_COUNT:
+                        log.info('Alert cleared after %d OK readings', consecutive_ok)
+                        alert_active = False
+                        consecutive_ok = 0
+
+            # Periodic xlsx save
             now_ts = time.time()
             if now_ts - last_save_ts >= SAVE_INTERVAL_SEC:
                 try:
@@ -201,6 +362,7 @@ def run_monitor():
                     log.exception('save_to_excel failed: %s', e)
                 last_save_ts = now_ts
 
+            # Hourly report at top of every hour
             if current_hour != last_hour:
                 hour_rows = [r for r in rows if r[0].startswith(last_hour)]
                 try:
@@ -212,17 +374,17 @@ def run_monitor():
         _interruptible_sleep(POLL_INTERVAL_SEC)
 
     try:
-        save_to_excel(rows, filepath)
+        if rows and filepath:
+            save_to_excel(rows, filepath)
     except Exception as e:
         log.exception('Final save_to_excel failed: %s', e)
-    log.info('Stopped cleanly. Data saved to %s', filepath)
+    log.info('Stopped cleanly.')
 
 
 def run_test():
     """Single-shot: log in, fetch one snapshot, send a test email, exit.
 
-    Use for verifying that .env credentials, API access and Gmail SMTP all
-    work end-to-end before leaving the monitor running.
+    Ignores work hours so you can verify the pipeline at any time.
     """
     api = ApiClient()
     if not api.login():
@@ -242,7 +404,7 @@ def run_test():
 
     rows = [[now.strftime('%H:%M'), total, connected, percent]]
     try:
-        send_email_report(rows, now.strftime('%H'), test=True)
+        send_email_report(rows, now.strftime('%H'), theme='test')
     except Exception as e:
         log.exception('Test email failed: %s', e)
         sys.exit(1)
