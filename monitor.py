@@ -244,8 +244,7 @@ def send_email_report(rows, hour, theme='normal'):
 
 def send_alert(rows, current_total, test=False):
     tag = ('[TEST]' + THEMES['alert']['tag']) if test else THEMES['alert']['tag']
-    title = (f"{tag}{BRAND_NAME} active calls: {current_total} "
-             f"(threshold {ALERT_THRESHOLD})")
+    title = f"{tag}{BRAND_NAME} active calls: {current_total}"
     html = render_html_report(rows, title, theme='alert')
     _send_email(title, html)
     log.warning('%sAlert sent: total_calls=%d (threshold %d)',
