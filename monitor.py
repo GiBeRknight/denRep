@@ -176,9 +176,16 @@ def render_html_report(rows, title, theme='normal'):
 
     body_rows = []
     for i, (_, row) in enumerate(df.iterrows()):
-        bg = '#fafafa' if i % 2 else '#ffffff'
+        is_avg = isinstance(row.iloc[0], str) and 'AVG' in row.iloc[0]
+        if is_avg:
+            bg = '#eef1f4'
+            extra = f' font-weight:700; border-top:2px solid {accent};'
+        else:
+            bg = '#fafafa' if i % 2 else '#ffffff'
+            extra = ''
         cells = ''.join(
-            f'<td style="{td_style_base} background:{bg};">{v}</td>' for v in row
+            f'<td style="{td_style_base} background:{bg};{extra}">{v}</td>'
+            for v in row
         )
         body_rows.append(f'<tr>{cells}</tr>')
 
@@ -219,7 +226,18 @@ def send_email_report(rows, hour, theme='normal'):
     tag = THEMES[theme]['tag']
     title = (f"{tag}{BRAND_NAME} Active Calls Report — "
              f"{datetime.now().strftime('%Y-%m-%d')} {hour}:00")
-    html = render_html_report(rows, title, theme=theme)
+
+    body_rows = list(rows)
+    if len(rows) > 1:
+        df = pd.DataFrame(rows, columns=EMAIL_COLUMNS)
+        body_rows.append([
+            f'{hour}:00 AVG',
+            round(df['total_calls'].mean()),
+            round(df['connected'].mean()),
+            round(df['percent %'].mean(), 2),
+        ])
+
+    html = render_html_report(body_rows, title, theme=theme)
     _send_email(title, html)
     log.info('[%s:00] %sReport sent to %s', hour, tag, EMAIL_TO)
 
