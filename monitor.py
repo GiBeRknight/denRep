@@ -144,7 +144,7 @@ def save_to_excel(rows, filepath):
                             columns=['time', 'total_calls', 'connected', 'percent %'])
     # Atomic write so a crash mid-write doesn't corrupt the xlsx
     tmp_path = filepath + '.tmp'
-    df_final.to_excel(tmp_path, index=False)
+    df_final.to_excel(tmp_path, index=False, engine='openpyxl')
     os.replace(tmp_path, filepath)
 
 
