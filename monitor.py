@@ -142,8 +142,11 @@ def save_to_excel(rows, filepath):
 
     df_final = pd.DataFrame(final_rows,
                             columns=['time', 'total_calls', 'connected', 'percent %'])
-    # Atomic write so a crash mid-write doesn't corrupt the xlsx
-    tmp_path = filepath + '.tmp'
+    # Atomic write so a crash mid-write doesn't corrupt the xlsx.
+    # Keep the .xlsx suffix on the tmp file — older pandas validates
+    # the extension even when an engine is passed explicitly.
+    base, ext = os.path.splitext(filepath)
+    tmp_path = f'{base}.tmp{ext}'
     df_final.to_excel(tmp_path, index=False, engine='openpyxl')
     os.replace(tmp_path, filepath)
 
